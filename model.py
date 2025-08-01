@@ -2,11 +2,12 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from keras.layers import MaxPooling1D, Dropout, Conv1DTranspose, Conv1D, BatchNormalization, Flatten, Dense, Input
-from keras.models import load_model, save_model, Sequential
+import keras
+from keras.layers import MaxPooling1D, Dropout, Conv1DTranspose, Conv1D, BatchNormalization, Flatten, Dense, Input, Reshape
+from keras.models import load_model, save_model, Sequential, Model
 from sklearn.model_selection import train_test_split
 from keras.optimizers import Adam
-from keras_tuner.tuners import RandomSearch
+from keras_tuner.tuners import BayesianOptimization
 
 
 # Function to calculate rolling minimum starting from the current row
@@ -136,6 +137,23 @@ class CNNModel(object):
         return model
 
     @classmethod
+    def get_hybrid_classifier_model(cls, n_input_features=5):
+        """Builds the classifier to accept original features + anomaly score."""
+        # This architecture should be based on your best tuned classifier
+        model = Sequential()
+        model.add(Input(shape=(cls.WINSIZE, n_input_features)))
+        model.add(Conv1D(filters=32, kernel_size=5, activation='relu'))
+        model.add(MaxPooling1D(pool_size=2))
+        model.add(Flatten())
+        model.add(Dense(50, activation='relu'))
+        model.add(Dense(1, activation='sigmoid'))
+        
+        model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+        print("--- Hybrid Classifier Model Summary ---")
+        model.summary()
+        return model
+
+    @classmethod
     def get_parameterized_model(cls, hp, num_features): # FIX 1: Add num_features as an argument
         model = Sequential()
         # FIX 2: Use the provided num_features instead of a hyperparameter
@@ -244,7 +262,7 @@ class CNNModel(object):
         else: # Otherwise, it's the classifier
             model_builder = lambda hp: cls.get_parameterized_model(hp, num_features=num_features)
 
-        tuner = RandomSearch(
+        tuner = BayesianOptimization(
             model_builder,
             objective=objective,
             directory="hp_tuning",
@@ -382,6 +400,79 @@ class CNNModel(object):
         model.summary()
         return model
 
+    @classmethod
+    def get_vae_model(cls, n_input_features=1, latent_dim=4): # Use latent_dim=4
+        """Builds the final, best-performing VAE model."""
+        # Encoder
+        encoder_inputs = Input(shape=(cls.WINSIZE, n_input_features))
+        x = Conv1D(32, 3, activation="relu", padding="same")(encoder_inputs) # Use filters=32
+        x = Conv1D(64, 3, activation="relu", padding="same")(x) # Use filters=64
+        x = Flatten()(x)
+        x = Dense(16, activation="relu")(x)
+        z_mean = Dense(latent_dim, name="z_mean")(x)
+        z_log_var = Dense(latent_dim, name="z_log_var")(x)
+        z = Sampling()([z_mean, z_log_var])
+        encoder = Model(encoder_inputs, [z_mean, z_log_var, z], name="encoder")
+
+        # Decoder
+        latent_inputs = Input(shape=(latent_dim,))
+        x = Dense(cls.WINSIZE * 16, activation="relu")(latent_inputs)
+        x = Reshape((cls.WINSIZE, 16))(x)
+        x = Conv1DTranspose(64, 3, activation="relu", padding="same")(x) # Use filters=64
+        x = Conv1DTranspose(32, 3, activation="relu", padding="same")(x) # Use filters=32
+        decoder_outputs = Conv1DTranspose(n_input_features, 3, activation="sigmoid", padding="same")(x)
+        decoder = Model(latent_inputs, decoder_outputs, name="decoder")
+
+        # VAE Model
+        vae = VAE(encoder, decoder)
+        vae.compile(optimizer=Adam(learning_rate=0.01)) # Use learning_rate=0.01
+        print("--- Best VAE Model Summary ---")
+        encoder.summary()
+        decoder.summary()
+        return vae
+
+    
+    @classmethod
+    def get_tunable_vae_model(cls, hp, n_input_features=1):
+        """Builds a VAE with tunable hyperparameters."""
+        # Define Hyperparameters
+        latent_dim = hp.Int('latent_dim', min_value=4, max_value=16, step=4)
+        filters_1 = hp.Int('filters_1', min_value=16, max_value=64, step=16)
+        filters_2 = hp.Int('filters_2', min_value=32, max_value=128, step=32)
+
+        # Encoder
+        encoder_inputs = Input(shape=(cls.WINSIZE, n_input_features))
+        x = Conv1D(filters_1, 3, activation="relu", padding="same")(encoder_inputs)
+        x = Conv1D(filters_2, 3, activation="relu", padding="same")(x)
+        x = Flatten()(x)
+        x = Dense(16, activation="relu")(x)
+        z_mean = Dense(latent_dim, name="z_mean")(x)
+        z_log_var = Dense(latent_dim, name="z_log_var")(x)
+        z = Sampling()([z_mean, z_log_var])
+        encoder = Model(encoder_inputs, [z_mean, z_log_var, z], name="encoder")
+
+        # Decoder
+        latent_inputs = Input(shape=(latent_dim,))
+        x = Dense(cls.WINSIZE * 16, activation="relu")(latent_inputs)
+        x = Reshape((cls.WINSIZE, 16))(x)
+        x = Conv1DTranspose(filters_2, 3, activation="relu", padding="same")(x)
+        x = Conv1DTranspose(filters_1, 3, activation="relu", padding="same")(x)
+        decoder_outputs = Conv1DTranspose(n_input_features, 3, activation="sigmoid", padding="same")(x)
+        decoder = Model(latent_inputs, decoder_outputs, name="decoder")
+
+        # VAE Model
+        vae = VAE(encoder, decoder)
+        
+        # Use a tunable learning rate
+        learning_rate = hp.Choice('learning_rate', values=[1e-2, 1e-3, 1e-4])
+        vae.compile(optimizer=Adam(learning_rate=learning_rate), loss="mse")
+
+        # ========= FIX IS HERE: Explicitly build the model =========
+        vae.build(input_shape=(None, cls.WINSIZE, n_input_features))
+        # =========================================================
+        
+        return vae
+
     def fit(
         self,
         df,
@@ -511,3 +602,107 @@ class CNNModel(object):
             .tolist()
         )
         return self.test_data
+
+@keras.saving.register_keras_serializable()
+class Sampling(tf.keras.layers.Layer):
+    """Uses (z_mean, z_log_var) to sample z, the vector encoding a digit."""
+    def call(self, inputs):
+        z_mean, z_log_var = inputs
+        batch = tf.shape(z_mean)[0]
+        dim = tf.shape(z_mean)[1]
+        epsilon = tf.keras.backend.random_normal(shape=(batch, dim))
+        return z_mean + tf.exp(0.5 * z_log_var) * epsilon
+
+@keras.saving.register_keras_serializable()
+class Sampling(tf.keras.layers.Layer):
+    """Uses (z_mean, z_log_var) to sample z, the vector encoding a digit."""
+    def call(self, inputs):
+        z_mean, z_log_var = inputs
+        batch = tf.shape(z_mean)[0]
+        dim = tf.shape(z_mean)[1]
+        epsilon = tf.keras.backend.random_normal(shape=(batch, dim))
+        return z_mean + tf.exp(0.5 * z_log_var) * epsilon
+
+@keras.saving.register_keras_serializable()
+class VAE(tf.keras.Model):
+    """
+    Combines the encoder, decoder, and custom loss into a single VAE model.
+    """
+    def __init__(self, encoder, decoder, **kwargs):
+        super(VAE, self).__init__(**kwargs)
+        self.encoder = encoder
+        self.decoder = decoder
+        self.total_loss_tracker = tf.keras.metrics.Mean(name="total_loss")
+        self.reconstruction_loss_tracker = tf.keras.metrics.Mean(name="reconstruction_loss")
+        self.kl_loss_tracker = tf.keras.metrics.Mean(name="kl_loss")
+
+    @property
+    def metrics(self):
+        return [
+            self.total_loss_tracker,
+            self.reconstruction_loss_tracker,
+            self.kl_loss_tracker,
+        ]
+
+    def call(self, inputs):
+        """Defines the forward pass of the VAE."""
+        _, _, z = self.encoder(inputs)
+        reconstruction = self.decoder(z)
+        return reconstruction
+
+    def train_step(self, data):
+        """Defines the custom training logic."""
+        x, y = data
+
+        with tf.GradientTape() as tape:
+            z_mean, z_log_var, z = self.encoder(x)
+            reconstruction = self.decoder(z)
+            reconstruction_loss = tf.reduce_mean(
+                tf.reduce_sum(
+                    tf.keras.losses.binary_crossentropy(y, reconstruction), axis=(1)
+                )
+            )
+            kl_loss = -0.5 * (1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
+            kl_loss = tf.reduce_mean(tf.reduce_sum(kl_loss, axis=1))
+            total_loss = reconstruction_loss + kl_loss
+            
+        grads = tape.gradient(total_loss, self.trainable_weights)
+        self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
+        
+        self.total_loss_tracker.update_state(total_loss)
+        self.reconstruction_loss_tracker.update_state(reconstruction_loss)
+        self.kl_loss_tracker.update_state(kl_loss)
+        
+        return {
+            "loss": self.total_loss_tracker.result(),
+            "reconstruction_loss": self.reconstruction_loss_tracker.result(),
+            "kl_loss": self.kl_loss_tracker.result(),
+        }
+
+    def test_step(self, data):
+        """Defines the validation/evaluation logic."""
+        x, y = data
+
+        z_mean, z_log_var, z = self.encoder(x)
+        reconstruction = self.decoder(z)
+        
+        reconstruction_loss = tf.reduce_mean(
+            tf.reduce_sum(
+                tf.keras.losses.binary_crossentropy(y, reconstruction), axis=(1)
+            )
+        )
+        kl_loss = -0.5 * (1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
+        kl_loss = tf.reduce_mean(tf.reduce_sum(kl_loss, axis=1))
+        total_loss = reconstruction_loss + kl_loss
+        
+        return {
+            "loss": total_loss,
+            "reconstruction_loss": reconstruction_loss,
+            "kl_loss": kl_loss,
+        }
+
+
+# TO-DO:
+
+# 1. Use uncertainty quantification to quantify uncertainty in flight decisions
+# 2. Create baseline DT for unsafety performance

@@ -5,7 +5,12 @@ import pandas as pd
 import numpy as np
 from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from keras.models import load_model
+import joblib
 import matplotlib.pyplot as plt
+from keras_tuner.tuners import BayesianOptimization
+
 
 # Import your model classes
 from model import CNNModel
@@ -112,11 +117,88 @@ def train(args):
         print(f"Training TFT on {len(X)} sequences...")
         
         tft = TemporalFusionTransformer(window_size=tft_window_size, prediction_horizon=future_target_len)
-        tft.build_model(num_features=1, hidden_layer_size=32, num_attention_heads=2)
+        tft.get_best_model(num_features=1)
         
         tft.fit(X, y, epochs=args.epochs)
         tft.save(args.output_path)
-        print(f"TFT model weights saved to {args.output_path}")
+        print(f"Best TFT model weights saved to {args.output_path}")
+
+    elif args.model_type == 'vae':
+        train_df = model_wrapper.extract_dataset('datasets/train_dataset.csv')
+        nominal_df = train_df[train_df["win_dist_0_10"] > 3.5]
+        print(f"Training VAE on {len(nominal_df)} nominal data windows...")
+        
+        # Prepare data for VAE (scaling is essential)
+        from sklearn.preprocessing import MinMaxScaler
+        scaler = MinMaxScaler()
+        x_train_list = nominal_df["r_zero"].to_list()
+        x_train_flat = np.array(x_train_list).flatten().reshape(-1, 1)
+        scaler.fit(x_train_flat)
+        x_train_scaled_flat = scaler.transform(x_train_flat)
+        x_train = x_train_scaled_flat.reshape(len(x_train_list), CNNModel.WINSIZE, 1)
+
+        vae_model = model_wrapper.get_vae_model(n_input_features=1)
+        # For VAE, the input is also the target
+        vae_model.fit(x_train, x_train, epochs=args.epochs, batch_size=128)
+        
+        # ========= FIX IS HERE: Save encoder and decoder to separate files =========
+        vae_model.encoder.save(args.output_path + "_encoder.keras")
+        vae_model.decoder.save(args.output_path + "_decoder.keras")
+        print(f"VAE model saved to {args.output_path}_[encoder/decoder].keras")
+    else:
+        print(f"Unknown model type: {args.model_type}")
+
+
+# In runner.py, add this new function
+
+def evaluate_vae(args):
+    """Evaluates the trained Variational Autoencoder."""
+    print("=== Evaluating Variational Autoencoder (VAE) ===")
+    
+    # --- Step 1: Load Models and Data ---
+    encoder = load_model(args.model_path + "_encoder.keras")
+    decoder = load_model(args.model_path + "_decoder.keras")
+    
+    model_wrapper = CNNModel()
+    test_df = model_wrapper.extract_dataset(args.eval_file)
+    print(f"--- Using evaluation file: {args.eval_file} ---")
+
+    # --- Step 2: Prepare and Scale Test Data ---
+    # The same scaler used during training must be applied here.
+    # For simplicity, we re-create it. In a production system, you would save/load the scaler.
+    from sklearn.preprocessing import MinMaxScaler
+    scaler = MinMaxScaler()
+    
+    # We fit the scaler on the full test set to establish its range for this dataset
+    x_test_list = test_df["r_zero"].to_list()
+    x_test_flat = np.array(x_test_list).flatten().reshape(-1, 1)
+    scaler.fit(x_test_flat) 
+    x_test_scaled_flat = scaler.transform(x_test_flat)
+    X_test = x_test_scaled_flat.reshape(len(x_test_list), CNNModel.WINSIZE, 1)
+
+    # --- Step 3: Get Predictions and Calculate Anomaly Score ---
+    print("\n--- Predicting with VAE and calculating anomaly scores ---")
+    _, _, z = encoder.predict(X_test)
+    reconstructions = decoder.predict(z)
+    
+    # The anomaly score is the reconstruction loss (e.g., Mean Squared Error)
+    mse = np.mean(np.power(X_test - reconstructions, 2), axis=1)
+    anomaly_scores = pd.Series(mse.flatten(), index=test_df.index)
+    test_df['anomaly_score'] = anomaly_scores
+    
+    # --- Step 4: Evaluate Performance Per-Log ---
+    print(f"Using anomaly threshold: {args.threshold}")
+    test_df['predicted_positive'] = test_df['anomaly_score'] > args.threshold
+    
+    print(f"\n--- Final Performance on {os.path.basename(args.eval_file)} (per log) ---")
+    log_labels = test_df.groupby(['log_folder', 'log_name'])[args.target_label].any()
+    log_predictions = test_df.groupby(['log_folder', 'log_name'])['predicted_positive'].any()
+    
+    print_stats(
+        f"VAE Prediction for '{args.target_label}'",
+        log_labels,
+        log_predictions
+    )
 
 
 def evaluate(args):
@@ -169,12 +251,13 @@ def evaluate(args):
         tft = TemporalFusionTransformer(window_size=tft_window_size, prediction_horizon=prediction_horizon)
         
         # FIX 3: Pass hyperparameters to tft.load() to build the correct architecture
-        print("Loading TFT model with correct architecture...")
+        print("Loading TFT model with best-tuned architecture...")
         tft.load(
             args.model_path, 
             num_features=1,
-            hidden_layer_size=32,  # This MUST match the value used in training
-            num_attention_heads=2  # This MUST match the value used in training
+            hidden_layer_size=64,  # Use the best value
+            num_attention_heads=2,  # Use the best value
+            dropout_rate=0.1        # Use the best value
         )
 
         # Now, proceed with prediction and evaluation
@@ -245,6 +328,57 @@ def tune(args):
             epochs=50,
             project_name="tune_autoencoder"
         )
+
+    elif args.model_type == 'vae':
+        # VAE is tuned on nominal data, but needs to be scaled to [0, 1]
+        train_data = model_wrapper.extract_dataset("datasets/train_dataset.csv")
+        nominal_data = train_data[train_data["win_dist_0_10"] > 3.5].copy()
+
+        # Prepare data for VAE (scaling is essential)
+        from sklearn.preprocessing import MinMaxScaler
+        scaler = MinMaxScaler()
+        x_train_list = nominal_data["r_zero"].to_list()
+        x_train_flat = np.array(x_train_list).flatten().reshape(-1, 1)
+        scaler.fit(x_train_flat)
+        x_train_scaled_flat = scaler.transform(x_train_flat)
+        x_train = x_train_scaled_flat.reshape(len(x_train_list), CNNModel.WINSIZE, 1)
+
+        tuner = BayesianOptimization(
+            lambda hp: model_wrapper.get_tunable_vae_model(hp, n_input_features=1),
+            objective="val_loss",
+            max_trials=args.trials,
+            directory="hp_tuning",
+            project_name="tune_vae",
+            overwrite=True
+        )
+        
+        # The VAE's loss is calculated on the input itself
+        tuner.search(x_train, x_train, epochs=30, validation_split=0.2)
+
+    elif args.model_type == 'tft':
+        train_df = model_wrapper.extract_dataset('datasets/train_dataset.csv')
+
+        # We need a smaller subset for tuning to be fast
+        subset_df = train_df.sample(n=5000, random_state=42)
+        
+        # Using the simplified data prep from our previous fixes
+        all_windows = np.array(subset_df['r_zero'].to_list(), dtype=np.float32)
+        past_history_len = 20
+        X = np.expand_dims(all_windows[:, :past_history_len], axis=-1)
+        y = np.expand_dims(all_windows[:, past_history_len:], axis=-1)
+        
+        tft = TemporalFusionTransformer(window_size=past_history_len, prediction_horizon=5)
+
+        tuner = BayesianOptimization(
+            tft.get_tunable_model,
+            objective="val_loss",
+            max_trials=args.trials,
+            directory="hp_tuning",
+            project_name="tune_tft",
+            overwrite=True
+        )
+        tuner.search(X, y, epochs=20, validation_split=0.2)
+
     
     print("\n----------------------------------------------------")
     print("---           BEST HYPERPARAMETERS           ---")
@@ -262,7 +396,7 @@ def main():
     
     # --- Train Command ---
     parser_train = subparsers.add_parser('train', help='Train a model')
-    parser_train.add_argument('model_type', choices=['autoencoder', 'classifier', 'tft'], help='Type of model to train')
+    parser_train.add_argument('model_type', choices=['autoencoder', 'classifier', 'tft', 'vae'], help='Type of model to train')
     parser_train.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
     parser_train.add_argument('--output-path', '-o', required=True, help='Path to save the trained model')
     parser_train.add_argument('--target-label', choices=['unsafe', 'uncertain'], default='uncertain', help="Target label for supervised models ('classifier')")
@@ -275,10 +409,18 @@ def main():
     parser_eval.add_argument('--target-label', choices=['unsafe', 'uncertain'], default='uncertain', help="Ground truth label to evaluate against")
     parser_eval.add_argument('--threshold', type=float, help="[Optional] Anomaly threshold for unsupervised models")
     parser_eval.set_defaults(func=evaluate)
+
+    # --- Evaluate VAE Command (New!) ---
+    parser_eval_vae = subparsers.add_parser('evaluate_vae', help='Evaluate a trained VAE model')
+    parser_eval_vae.add_argument('--model-path', required=True, help='Base path to the saved VAE encoder/decoder models (without the _encoder/_decoder suffix)')
+    parser_eval_vae.add_argument('--eval-file', default='datasets/test2_dataset.csv', help="Path to the dataset for evaluation")
+    parser_eval_vae.add_argument('--target-label', choices=['unsafe', 'uncertain'], default='unsafe', help="Ground truth label to evaluate against")
+    parser_eval_vae.add_argument('--threshold', type=float, default=0.1, help="Anomaly threshold for the reconstruction loss")
+    parser_eval_vae.set_defaults(func=evaluate_vae)
     
     # --- Tune Command (New!) ---
     parser_tune = subparsers.add_parser('tune', help='Tune hyperparameters for a model')
-    parser_tune.add_argument('model_type', choices=['classifier', 'autoencoder'], help='Type of model to tune') # Can be extended
+    parser_tune.add_argument('model_type', choices=['classifier', 'autoencoder', 'tft', 'vae'], help='Type of model to tune') # Can be extended
     parser_tune.add_argument('--trials', type=int, default=10, help='Number of tuning trials to run')
     parser_tune.add_argument('--target-label', choices=['unsafe', 'uncertain'], default='uncertain', help="Target label for supervised models")
     parser_tune.set_defaults(func=tune)

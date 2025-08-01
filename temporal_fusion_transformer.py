@@ -107,6 +107,36 @@ class TemporalFusionTransformer:
         self.model = None
         self.history = None
 
+    def get_tunable_model(self, hp):
+        """Builds a tunable TFT model for KerasTuner."""
+        # Define Hyperparameters
+        hidden_layer_size = hp.Int('hidden_layer_size', min_value=16, max_value=64, step=16)
+        num_attention_heads = hp.Int('num_attention_heads', min_value=2, max_value=4, step=2)
+        dropout_rate = hp.Float('dropout_rate', min_value=0.1, max_value=0.4, step=0.1)
+        learning_rate = hp.Choice('learning_rate', values=[1e-2, 1e-3, 1e-4])
+
+        # Reuse the existing build_model logic with the hyperparameters
+        # Assuming num_features=1 for this problem
+        self.build_model(
+            num_features=1,
+            hidden_layer_size=hidden_layer_size,
+            num_attention_heads=num_attention_heads,
+            dropout_rate=dropout_rate
+        )
+        self.model.compile(optimizer=Adam(learning_rate=learning_rate), loss=self.quantile_loss)
+        return self.model
+
+    def get_best_model(self, num_features=1):
+        """Builds the final TFT model using the best-found hyperparameters."""
+        self.build_model(
+            num_features=num_features,
+            hidden_layer_size=64,
+            num_attention_heads=2,
+            dropout_rate=0.1
+        )
+        self.model.compile(optimizer=Adam(learning_rate=0.001), loss=self.quantile_loss)
+        return self.model
+
     def build_model(self, num_features=1, hidden_layer_size=64, num_attention_heads=4, dropout_rate=0.1):
         # Input layer
         past_inputs = Input(shape=(self.window_size, num_features), name='past_inputs')
@@ -209,11 +239,12 @@ class TemporalFusionTransformer:
         # We need to save weights only as custom layers can be complex to save/load fully
         self.model.save_weights(filepath)
 
-    def load(self, filepath, num_features=1, hidden_layer_size=64, num_attention_heads=4):
+    def load(self, filepath, num_features=1, hidden_layer_size=64, num_attention_heads=4, dropout_rate=0.1):
         # Build the model first to have the correct architecture
         self.build_model(
             num_features=num_features, 
             hidden_layer_size=hidden_layer_size, 
-            num_attention_heads=num_attention_heads
+            num_attention_heads=num_attention_heads,
+            dropout_rate=dropout_rate
         )
         self.model.load_weights(filepath)
