@@ -103,6 +103,11 @@ data/
 processed_data/
 # Ignore any directory named 'results' (often contains generated data/CSVs) and all its contents
 results/
+experiments/
+mlruns/
+keras_tuner/
+hp_tuning/
+models/
 *.png
 # Ignore any data files
 *.csv

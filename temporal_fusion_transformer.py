@@ -33,38 +33,37 @@ from datetime import datetime
 
 def prepare_tft_data(df, past_history_len, future_target_len, features, target):
     """
-    Prepares windowed data for the TFT model.
+    Prepares windowed data for the TFT model by splitting the list in each row
+    into a history and a future target.
     """
     X, y = [], []
-    # Assuming a single target feature for simplicity, which matches your use case
-    target_series = df[target] 
-    features_df = df[features]
+    
+    # The 'r_zero' column contains lists which are our sequences
+    sequences = df[features[0]].to_list()
+    
+    # Process each sequence (from each row)
+    for seq in sequences:
+        # The total length must accommodate both history and future
+        if len(seq) >= past_history_len + future_target_len:
+            past_end = past_history_len
+            future_end = past_end + future_target_len
+            
+            # Append the history part for X
+            X.append(seq[0:past_end])
+            # Append the future part for y
+            y.append(seq[past_end:future_end])
 
-    for i in range(len(df) - past_history_len - future_target_len + 1):
-        past_end = i + past_history_len
-        future_end = past_end + future_target_len
-        
-        # --- FIX: Use np.stack to convert lists into a numerical array ---
-        # For the input features (X)
-        x_slice = features_df.iloc[i:past_end]
-        # We need to handle one or more features
-        stacked_x = np.stack(x_slice[features[0]].values)
-        if len(features) > 1:
-            for i, feature in enumerate(features[1:]):
-                stacked_feature = np.stack(x_slice[feature].values)
-                stacked_x = np.dstack([stacked_x, stacked_feature])
-
-        # For the target variable (y)
-        stacked_y = np.stack(target_series.iloc[past_end:future_end].values)
-        
-        X.append(stacked_x)
-        # The TFT model's output layer expects a shape of (prediction_horizon, num_quantiles)
-        # The y data needs to be shaped as (prediction_horizon, 1) to match the median prediction
-        y.append(stacked_y.reshape(-1, 1))
-        
-    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
-
-# --- Core TFT Layers (Simplified for this use case) ---
+    # Convert to numpy arrays
+    X_array = np.array(X, dtype=np.float32)
+    y_array = np.array(y, dtype=np.float32)
+    
+    # Reshape arrays to add the "features" dimension, which is 1
+    # X shape becomes: (num_samples, 20, 1)
+    # y shape becomes: (num_samples, 5, 1) for the quantile loss
+    X_array = X_array.reshape(X_array.shape[0], X_array.shape[1], 1)
+    y_array = y_array.reshape(y_array.shape[0], y_array.shape[1], 1)
+    
+    return X_array, y_array
 
 class GatedResidualNetwork(tf.keras.layers.Layer):
     def __init__(self, units, dropout_rate=0.1, **kwargs):
@@ -239,7 +238,7 @@ class TemporalFusionTransformer:
         # We need to save weights only as custom layers can be complex to save/load fully
         self.model.save_weights(filepath)
 
-    def load(self, filepath, num_features=1, hidden_layer_size=64, num_attention_heads=4, dropout_rate=0.1):
+    def load(self, filepath, num_features=1, hidden_layer_size=64, num_attention_heads=2, dropout_rate=0.1):
         # Build the model first to have the correct architecture
         self.build_model(
             num_features=num_features, 
